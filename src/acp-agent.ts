@@ -7,6 +7,8 @@ import {
   ClientCapabilities,
   InitializeRequest,
   InitializeResponse,
+  LoadSessionRequest,
+  LoadSessionResponse,
   ndJsonStream,
   NewSessionRequest,
   NewSessionResponse,
@@ -112,6 +114,7 @@ export class ClaudeAcpAgent implements Agent {
     return {
       protocolVersion: 1,
       agentCapabilities: {
+        loadSession: true,
         promptCapabilities: {
           image: true,
           embeddedContext: true,
@@ -302,6 +305,176 @@ export class ClaudeAcpAgent implements Agent {
 
     return {
       sessionId,
+      models,
+      modes: {
+        currentModeId: permissionMode,
+        availableModes,
+      },
+    };
+  }
+
+  async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
+    if (
+      fs.existsSync(path.resolve(os.homedir(), ".claude.json.backup")) &&
+      !fs.existsSync(path.resolve(os.homedir(), ".claude.json"))
+    ) {
+      throw RequestError.authRequired();
+    }
+
+    const { sessionId, cwd, mcpServers: mcpServersParam } = params;
+    const input = new Pushable<SDKUserMessage>();
+
+    // Build MCP servers config (same as newSession)
+    const mcpServers: Record<string, McpServerConfig> = {};
+    if (Array.isArray(mcpServersParam)) {
+      for (const server of mcpServersParam) {
+        if ("type" in server) {
+          mcpServers[server.name] = {
+            type: server.type,
+            url: server.url,
+            headers: server.headers
+              ? Object.fromEntries(server.headers.map((e) => [e.name, e.value]))
+              : undefined,
+          };
+        } else {
+          mcpServers[server.name] = {
+            type: "stdio",
+            command: server.command,
+            args: server.args,
+            env: server.env
+              ? Object.fromEntries(server.env.map((e) => [e.name, e.value]))
+              : undefined,
+          };
+        }
+      }
+    }
+
+    const server = createMcpServer(this, sessionId, this.clientCapabilities);
+    mcpServers["acp"] = {
+      type: "sdk",
+      name: "acp",
+      instance: server,
+    };
+
+    const permissionServer = await createPermissionMcpServer(this, sessionId);
+    const address = permissionServer.address() as AddressInfo;
+    mcpServers["acpPermission"] = {
+      type: "http",
+      url: "http://127.0.0.1:" + address.port + "/mcp",
+      headers: {
+        "x-acp-proxy-session-id": sessionId,
+      },
+    };
+
+    let systemPrompt: Options["systemPrompt"] = { type: "preset", preset: "claude_code" };
+    if (params._meta?.systemPrompt) {
+      const customPrompt = params._meta.systemPrompt;
+      if (typeof customPrompt === "string") {
+        systemPrompt = customPrompt;
+      } else if (
+        typeof customPrompt === "object" &&
+        "append" in customPrompt &&
+        typeof customPrompt.append === "string"
+      ) {
+        systemPrompt.append = customPrompt.append;
+      }
+    }
+
+    const permissionMode = "default";
+
+    const options: Options = {
+      cwd,
+      includePartialMessages: true,
+      mcpServers,
+      systemPrompt,
+      settingSources: ["user", "project", "local"],
+      permissionMode: IS_ROOT ? permissionMode : "bypassPermissions",
+      permissionPromptToolName: PERMISSION_TOOL_NAME,
+      stderr: (err) => console.error(err),
+      executable: process.execPath as any,
+      resume: sessionId,  // ✅ This is the key: tell SDK to resume the session!
+      ...(process.env.CLAUDE_CODE_EXECUTABLE && {
+        pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE,
+      }),
+    };
+
+    const allowedTools = [];
+    const disallowedTools = [];
+    if (this.clientCapabilities?.fs?.readTextFile) {
+      allowedTools.push(toolNames.read);
+      disallowedTools.push("Read");
+    }
+    if (this.clientCapabilities?.fs?.writeTextFile) {
+      disallowedTools.push("Write", "Edit");
+    }
+    if (this.clientCapabilities?.terminal) {
+      allowedTools.push(toolNames.bashOutput, toolNames.killShell);
+      disallowedTools.push("Bash", "BashOutput", "KillShell");
+    }
+
+    if (allowedTools.length > 0) {
+      options.allowedTools = allowedTools;
+    }
+    if (disallowedTools.length > 0) {
+      options.disallowedTools = disallowedTools;
+    }
+
+    const q = query({
+      prompt: input,
+      options,
+    });
+
+    this.sessions[sessionId] = {
+      query: q,
+      input: input,
+      cancelled: false,
+      permissionMode,
+    };
+
+    const availableCommands = await getAvailableSlashCommands(q);
+    const models = await getAvailableModels(q);
+
+    if (!IS_ROOT) {
+      await q.setPermissionMode(permissionMode);
+    }
+
+    setTimeout(() => {
+      this.client.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "available_commands_update",
+          availableCommands,
+        },
+      });
+    }, 0);
+
+    const availableModes = [
+      {
+        id: "default",
+        name: "Always Ask",
+        description: "Prompts for permission on first use of each tool",
+      },
+      {
+        id: "acceptEdits",
+        name: "Accept Edits",
+        description: "Automatically accepts file edit permissions for the session",
+      },
+      {
+        id: "plan",
+        name: "Plan Mode",
+        description: "Claude can analyze but not modify files or execute commands",
+      },
+    ];
+
+    if (!IS_ROOT) {
+      availableModes.push({
+        id: "bypassPermissions",
+        name: "Bypass Permissions",
+        description: "Skips all permission prompts",
+      });
+    }
+
+    return {
       models,
       modes: {
         currentModeId: permissionMode,
